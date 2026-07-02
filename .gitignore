@@ -1,0 +1,6 @@
+node_modules
+coverage
+dist
+.safe-agent-restart
+*.log
+.DS_Store
