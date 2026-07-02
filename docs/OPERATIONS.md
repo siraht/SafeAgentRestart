@@ -16,9 +16,10 @@ The project separates observation from mutation:
 
 1. `update-plan` detects installed CLIs and prints update/reinstall commands.
 2. `inventory` reads tmux pane metadata and process trees.
-3. `capture` reads scrollback and writes files.
-4. `plan` reads scrollback and prints candidate resume commands.
-5. Human operators perform updates, quit, and resume actions manually.
+3. `readiness` checks whether visible panes look between turns.
+4. `capture` reads scrollback and writes files.
+5. `plan` reads scrollback and prints candidate resume commands.
+6. Human operators perform updates, quit, and resume actions manually.
 
 This keeps accidental restarts out of scheduled jobs and agent automation.
 
@@ -47,6 +48,7 @@ claude install stable --force
 Then process one pane at a time:
 
 ```bash
+bun src/safe-agent-restart.ts readiness --pane '<pane>' --text
 bun src/safe-agent-restart.ts capture --pane '<pane>'
 bun src/safe-agent-restart.ts plan --pane '<pane>' --text
 tmux send-keys -t '<pane>' C-c
@@ -55,6 +57,16 @@ tmux send-keys -t '<pane>' '<resume-command>' Enter
 ```
 
 Process one pane at a time. Do not bulk quit active agents unless every pane has a reviewed capture.
+
+## Turn Readiness
+
+Codex, Claude Code, and OpenCode do not expose a stable shared API that says "this pane is between turns." SafeAgentRestart uses deterministic read-only heuristics instead:
+
+- `idle` with `restartSafe=true`: visible idle prompt and no active child command.
+- `busy` with `restartSafe=false`: visible activity marker or active child tool command.
+- `unknown` with `restartSafe=false`: typed prompt draft, persistent child service, missing prompt, or ambiguous screen state.
+
+Scheduled automation should skip every pane except `restartSafe=true`. This intentionally favors missing restart opportunities over interrupting a live turn.
 
 ## Why Not `ntm respawn`
 

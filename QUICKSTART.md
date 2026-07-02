@@ -36,7 +36,15 @@ bun src/safe-agent-restart.ts capture --pane 'cashfirst:1.4'
 
 Capture files are written under `.safe-agent-restart/captures/<timestamp>/`.
 
-## 4. Build A Plan
+## 4. Check Turn Readiness
+
+```bash
+bun src/safe-agent-restart.ts readiness --pane 'cashfirst:1.4' --text
+```
+
+Only continue if the pane reports `restartSafe=true`. `busy` and `unknown` both mean skip the pane for now.
+
+## 5. Build A Plan
 
 ```bash
 bun src/safe-agent-restart.ts plan --pane 'cashfirst:1.4' --text
@@ -48,7 +56,7 @@ If a UUID-style session ID is visible in scrollback, the plan uses it. Otherwise
 - Claude Code: `--continue`
 - OpenCode: `--continue`
 
-## 5. Manual Restart
+## 6. Manual Restart
 
 Only after reviewing the capture:
 
@@ -59,7 +67,7 @@ tmux capture-pane -p -t 'cashfirst:1.4' -S -5000
 
 If the post-quit output prints a better resume command, use that. Otherwise use the command from the plan.
 
-## 6. Resume
+## 7. Resume
 
 Codex:
 

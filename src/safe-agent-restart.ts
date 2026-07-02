@@ -37,6 +37,7 @@ interface RestartPlanItem {
   cwd: string;
   kind: AgentKind;
   currentBypassMode: boolean;
+  turnState: TurnState;
   sessionIds: string[];
   recommendedResumeCommand?: string;
   gracefulQuitKeys: string[];
@@ -62,6 +63,33 @@ interface ToolUpdate {
   installMethod?: string;
   reinstallCommand?: string;
   notes: string[];
+}
+
+type TurnStatus = "idle" | "busy" | "unknown";
+
+interface TurnState {
+  status: TurnStatus;
+  restartSafe: boolean;
+  evidence: string[];
+  notes: string[];
+}
+
+interface ReadinessReport {
+  generatedAt: string;
+  panes: ReadinessItem[];
+}
+
+interface ReadinessItem {
+  pane: string;
+  paneId: string;
+  cwd: string;
+  kind: AgentKind;
+  turnState: TurnState;
+}
+
+interface ActiveChildCommand {
+  line: string;
+  likelyPersistentService: boolean;
 }
 
 interface CliOptions {
@@ -157,7 +185,7 @@ function inspectPane(row: string): Pane {
   }
 
   const rootPid = parsePositiveInt(rootPidRaw, "pane_pid");
-  const processTree = safeRun("pstree", ["-ap", String(rootPid)]).replace(/\s+/g, " ").trim();
+  const processTree = safeRun("pstree", ["-ap", String(rootPid)]).trim();
 
   return {
     paneId,
@@ -242,6 +270,7 @@ USAGE:
 COMMANDS:
   update-plan            Detect installed agent CLIs and print update/reinstall commands
   inventory              Read-only inventory of tmux panes and live agent processes
+  readiness              Check whether detected panes look between turns
   capture                Capture pane scrollback to files without sending keys
   plan                   Build read-only restart/resume plan from pane scrollback
   sequence               Print the manual restart sequence for Codex, Claude, and OpenCode
@@ -277,6 +306,20 @@ function capture(options: CliOptions): { outputDir: string; captures: Array<{ pa
   return { outputDir, captures };
 }
 
+function readiness(options: CliOptions): ReadinessReport {
+  const panes = inventory(options).filter((pane) => pane.agent.kind !== "unknown");
+  return {
+    generatedAt: new Date().toISOString(),
+    panes: panes.map((pane) => ({
+      pane: pane.label,
+      paneId: pane.paneId,
+      cwd: pane.cwd,
+      kind: pane.agent.kind,
+      turnState: assessTurnState(pane.agent.kind, captureVisiblePane(pane.paneId), pane.processTree),
+    })),
+  };
+}
+
 function buildPlan(options: CliOptions): RestartPlan {
   const panes = inventory(options).filter((pane) => pane.agent.kind !== "unknown");
   return {
@@ -284,6 +327,7 @@ function buildPlan(options: CliOptions): RestartPlan {
     scrollbackLines: options.scrollback,
     updatePlan: buildUpdatePlan(),
     panes: panes.map((pane) => {
+      const visibleText = captureVisiblePane(pane.paneId);
       const scrollback = safeRun("tmux", ["capture-pane", "-p", "-t", pane.paneId, "-S", `-${options.scrollback}`]);
       const sessionIds = extractSessionIds(scrollback);
       const latestSessionId = sessionIds.at(-1);
@@ -294,6 +338,7 @@ function buildPlan(options: CliOptions): RestartPlan {
         cwd: pane.cwd,
         kind: pane.agent.kind,
         currentBypassMode: pane.agent.bypassMode,
+        turnState: assessTurnState(pane.agent.kind, visibleText, pane.processTree),
         sessionIds,
         ...(recommendedResumeCommand ? { recommendedResumeCommand } : {}),
         gracefulQuitKeys: ["C-c"],
@@ -303,9 +348,180 @@ function buildPlan(options: CliOptions): RestartPlan {
   };
 }
 
+function captureVisiblePane(paneId: string): string {
+  return safeRun("tmux", ["capture-pane", "-p", "-t", paneId]);
+}
+
 export function extractSessionIds(text: string): string[] {
   const matches = text.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) ?? [];
   return [...new Set(matches.map((match) => match.toLowerCase()))];
+}
+
+export function assessTurnState(kind: AgentKind, visibleText: string, processTree: string): TurnState {
+  const evidence: string[] = [];
+  const notes: string[] = [];
+  const recentText = tailNonEmptyLines(visibleText, 80).join("\n");
+  const activeChild = detectActiveChildCommand(kind, processTree);
+
+  if (activeChild?.likelyPersistentService) {
+    evidence.push(`persistent child process: ${activeChild.line}`);
+    return {
+      status: "unknown",
+      restartSafe: false,
+      evidence,
+      notes: ["A persistent child service appears to be attached to the agent; skip automatic restart."],
+    };
+  }
+
+  if (activeChild) {
+    evidence.push(`active child process: ${activeChild.line}`);
+    return {
+      status: "busy",
+      restartSafe: false,
+      evidence,
+      notes: ["A tool or shell process appears to be running under the agent."],
+    };
+  }
+
+  const busyMarker = detectBusyMarker(kind, recentText);
+  if (busyMarker) {
+    evidence.push(`busy screen marker: ${busyMarker}`);
+    return {
+      status: "busy",
+      restartSafe: false,
+      evidence,
+      notes: ["The visible TUI still looks mid-turn."],
+    };
+  }
+
+  const draftPrompt = detectPromptDraft(kind, recentText);
+  if (draftPrompt) {
+    evidence.push(`prompt has draft text: ${draftPrompt}`);
+    return {
+      status: "unknown",
+      restartSafe: false,
+      evidence,
+      notes: ["The pane may be waiting for input, but a visible draft could be lost."],
+    };
+  }
+
+  const idlePrompt = detectIdlePrompt(kind, recentText);
+  if (idlePrompt) {
+    evidence.push(`idle prompt marker: ${idlePrompt}`);
+    return {
+      status: "idle",
+      restartSafe: true,
+      evidence,
+      notes: ["Conservative screen check found an idle prompt and no active child command."],
+    };
+  }
+
+  return {
+    status: "unknown",
+    restartSafe: false,
+    evidence,
+    notes: ["No reliable idle prompt was detected; skip automatic restart for this pane."],
+  };
+}
+
+function tailNonEmptyLines(text: string, count: number): string[] {
+  return text
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0)
+    .slice(-count);
+}
+
+function detectActiveChildCommand(kind: AgentKind, processTree: string): ActiveChildCommand | undefined {
+  const processLines = processTree.split("\n").map((line) => line.trim()).filter(Boolean).slice(1);
+  const activeCommand = /\b(?:bash|zsh|sh|fish|node|bun|npm|pnpm|yarn|python|python3|ruby|go|cargo|rustc|gcc|g\+\+|make|cmake|git|rg|grep|curl|wget|tsx|ts-node|deno|uv|pytest|playwright)\b/i;
+  for (const line of processLines) {
+    if (!activeCommand.test(line)) continue;
+    if (isAgentWrapperLine(kind, line)) continue;
+    if (/\{[^}]+\}/.test(line)) continue;
+    const compactLine = line.replace(/\s+/g, " ");
+    return {
+      line: compactLine,
+      likelyPersistentService: /\bmcp\b|@playwright\/mcp|n8n-mcp/i.test(compactLine),
+    };
+  }
+  return undefined;
+}
+
+function isAgentWrapperLine(kind: AgentKind, line: string): boolean {
+  const lower = line.toLowerCase();
+  if (kind === "codex") {
+    return lower.includes("/codex") || /\bcodex,\d+/.test(lower);
+  }
+  if (kind === "claude") {
+    return lower.includes("/claude") || /\bclaude,\d+/.test(lower);
+  }
+  if (kind === "opencode") {
+    return lower.includes("/opencode") || /\bopencode,\d+/.test(lower);
+  }
+  return false;
+}
+
+function detectBusyMarker(kind: AgentKind, text: string): string | undefined {
+  const markers: Array<[RegExp, string]> = [
+    [/\b(Pursuing goal|Running|Executing|Applying patch|Editing|Thinking|Working)\b/i, "active status text"],
+    [/\b(ctrl\+c|esc|escape)\s+to\s+(interrupt|stop|cancel)\b/i, "interrupt hint"],
+    [/\b(waiting for|running)\s+(tool|command|approval)\b/i, "tool status"],
+  ];
+  if (kind === "claude") {
+    markers.push([/[✻✽]\s*(Working|Thinking|Running)/i, "Claude activity glyph"]);
+  }
+  if (kind === "opencode") {
+    markers.push([/\b(Session|Assistant)\s+(running|thinking)\b/i, "OpenCode activity text"]);
+  }
+
+  for (const [pattern, label] of markers) {
+    if (pattern.test(text)) return label;
+  }
+  return undefined;
+}
+
+function detectPromptDraft(kind: AgentKind, text: string): string | undefined {
+  const promptPatterns = promptRegexes(kind);
+  const lines = tailNonEmptyLines(text, 12);
+  for (const line of lines) {
+    for (const pattern of promptPatterns) {
+      const match = line.match(pattern);
+      if (match?.groups?.draft && match.groups.draft.trim().length > 0) {
+        return truncateEvidence(line.trim());
+      }
+    }
+  }
+  return undefined;
+}
+
+function detectIdlePrompt(kind: AgentKind, text: string): string | undefined {
+  const promptPatterns = promptRegexes(kind);
+  const lines = tailNonEmptyLines(text, 12);
+  for (const line of lines.reverse()) {
+    for (const pattern of promptPatterns) {
+      const match = line.match(pattern);
+      if (match && (!match.groups?.draft || match.groups.draft.trim().length === 0)) {
+        return truncateEvidence(line.trim());
+      }
+    }
+  }
+  return undefined;
+}
+
+function promptRegexes(kind: AgentKind): RegExp[] {
+  const codexPrompt = /^\s*›\s*(?<draft>.*)$/;
+  const claudePrompt = /^\s*❯\s*(?<draft>.*)$/;
+  const asciiPrompt = /^\s*>\s*(?<draft>.*)$/;
+  if (kind === "codex") return [codexPrompt];
+  if (kind === "claude") return [claudePrompt];
+  if (kind === "opencode") return [asciiPrompt, claudePrompt];
+  return [codexPrompt, claudePrompt, asciiPrompt];
+}
+
+function truncateEvidence(value: string): string {
+  return value.length > 100 ? `${value.slice(0, 97)}...` : value;
 }
 
 export function buildResumeCommand(kind: AgentKind, sessionId: string | undefined): string | undefined {
@@ -451,16 +667,19 @@ function showSequence(): void {
 1. Capture scrollback:
    safe-agent-restart capture --pane '<session:window.pane>'
 
-2. Build the read-only plan:
+2. Confirm the pane looks between turns:
+   safe-agent-restart readiness --pane '<session:window.pane>' --text
+
+3. Build the read-only plan:
    safe-agent-restart plan --pane '<session:window.pane>' --text
 
-3. Gracefully quit only that pane's agent:
+4. Gracefully quit only that pane's agent if readiness says restartSafe=true:
    tmux send-keys -t '<session:window.pane>' C-c
 
-4. Capture the post-quit output:
+5. Capture the post-quit output:
    tmux capture-pane -p -t '<session:window.pane>' -S -5000
 
-5. Resume with the planned command, or replace the session id with the post-quit id:
+6. Resume with the planned command, or replace the session id with the post-quit id:
    Codex:    codex --dangerously-bypass-approvals-and-sandbox resume <session-id>
    Claude:   claude --dangerously-skip-permissions --resume <session-id>
    OpenCode: opencode --session <session-id>
@@ -470,7 +689,7 @@ Fallbacks when no session id is visible:
    Claude:   claude --dangerously-skip-permissions --continue
    OpenCode: opencode --continue
 
-This project intentionally does not automate steps 3-5 yet.`);
+This project intentionally does not automate quit/resume steps yet.`);
 }
 
 function printResult(value: unknown, json: boolean): void {
@@ -493,8 +712,24 @@ function printResult(value: unknown, json: boolean): void {
       console.log(`  ${command}`);
     }
     for (const pane of value.panes) {
-      console.log(`${pane.pane}\t${pane.kind}\t${pane.recommendedResumeCommand ?? "no-resume-command"}\tcwd=${pane.cwd}`);
+      console.log(`${pane.pane}\t${pane.kind}\tturn=${pane.turnState.status}\trestartSafe=${pane.turnState.restartSafe}\t${pane.recommendedResumeCommand ?? "no-resume-command"}\tcwd=${pane.cwd}`);
+      for (const item of pane.turnState.evidence) {
+        console.log(`  evidence: ${item}`);
+      }
       for (const note of pane.notes) {
+        console.log(`  note: ${note}`);
+      }
+    }
+    return;
+  }
+
+  if (isReadinessReport(value)) {
+    for (const pane of value.panes) {
+      console.log(`${pane.pane}\t${pane.kind}\tturn=${pane.turnState.status}\trestartSafe=${pane.turnState.restartSafe}\tcwd=${pane.cwd}`);
+      for (const item of pane.turnState.evidence) {
+        console.log(`  evidence: ${item}`);
+      }
+      for (const note of pane.turnState.notes) {
         console.log(`  note: ${note}`);
       }
     }
@@ -522,11 +757,15 @@ function printResult(value: unknown, json: boolean): void {
 }
 
 function isRestartPlan(value: unknown): value is RestartPlan {
-  return Boolean(value && typeof value === "object" && "panes" in value);
+  return Boolean(value && typeof value === "object" && "panes" in value && "updatePlan" in value && "scrollbackLines" in value);
 }
 
 function isUpdatePlan(value: unknown): value is UpdatePlan {
   return Boolean(value && typeof value === "object" && "tools" in value && "commands" in value);
+}
+
+function isReadinessReport(value: unknown): value is ReadinessReport {
+  return Boolean(value && typeof value === "object" && "panes" in value && "generatedAt" in value);
 }
 
 function main(): void {
@@ -538,6 +777,8 @@ function main(): void {
       printResult(buildUpdatePlan(), options.json);
     } else if (options.command === "inventory") {
       printResult(inventory(options), options.json);
+    } else if (options.command === "readiness") {
+      printResult(readiness(options), options.json);
     } else if (options.command === "capture") {
       printResult(capture(options), options.json);
     } else if (options.command === "plan") {

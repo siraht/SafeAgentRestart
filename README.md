@@ -44,6 +44,12 @@ Inventory live agent panes:
 bun src/safe-agent-restart.ts inventory --text
 ```
 
+Check whether detected agent panes look safely between turns:
+
+```bash
+bun src/safe-agent-restart.ts readiness --text
+```
+
 Capture scrollback for all detected agent panes:
 
 ```bash
@@ -91,6 +97,16 @@ OpenCode:
 opencode --session <session-id>
 opencode --continue
 ```
+
+## Turn Readiness
+
+The agent CLIs do not currently expose a reliable cross-tool "between turns" API. SafeAgentRestart therefore uses conservative read-only heuristics:
+
+- visible idle prompt and no active child process: `restartSafe=true`
+- visible activity marker: `restartSafe=false`
+- typed prompt draft, persistent child service, or no reliable prompt: `restartSafe=false`
+
+Any future automation should only restart panes where `readiness` or `plan` reports `restartSafe=true`.
 
 ## Update Syntax
 

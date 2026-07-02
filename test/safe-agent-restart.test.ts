@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildResumeCommand, detectAgent, extractSessionIds } from "../src/safe-agent-restart";
+import { assessTurnState, buildResumeCommand, detectAgent, extractSessionIds } from "../src/safe-agent-restart";
 
 describe("detectAgent", () => {
   test("detects Codex bypass mode from a process tree", () => {
@@ -57,5 +57,45 @@ describe("buildResumeCommand", () => {
       "opencode --session 019e2816-ca83-78e1-8c1e-222222222222",
     );
     expect(buildResumeCommand("opencode", undefined)).toBe("opencode --continue");
+  });
+});
+
+describe("assessTurnState", () => {
+  test("marks a Claude prompt with no active child process as idle", () => {
+    const state = assessTurnState("claude", "✻ Worked for 0s\n\n❯ ", "claude,100 --dangerously-skip-permissions");
+    expect(state.status).toBe("idle");
+    expect(state.restartSafe).toBe(true);
+  });
+
+  test("marks visible Codex activity as busy", () => {
+    const state = assessTurnState("codex", "gpt-5.5  Pursuing goal (5h 49m)\n› ", "codex,100 --dangerously-bypass-approvals-and-sandbox");
+    expect(state.status).toBe("busy");
+    expect(state.restartSafe).toBe(false);
+  });
+
+  test("marks prompt draft text as unknown to avoid losing input", () => {
+    const state = assessTurnState("codex", "Conversation interrupted\n\n› Implement {feature}", "codex,100 --dangerously-bypass-approvals-and-sandbox");
+    expect(state.status).toBe("unknown");
+    expect(state.restartSafe).toBe(false);
+  });
+
+  test("marks active child tool processes as busy", () => {
+    const state = assessTurnState(
+      "codex",
+      "› ",
+      "codex,100 --dangerously-bypass-approvals-and-sandbox\n  `-bash,200 -lc bun test",
+    );
+    expect(state.status).toBe("busy");
+    expect(state.restartSafe).toBe(false);
+  });
+
+  test("marks persistent MCP child processes as unknown instead of idle", () => {
+    const state = assessTurnState(
+      "codex",
+      "› ",
+      "codex,100 --dangerously-bypass-approvals-and-sandbox\n  `-node,200 /usr/bin/npx @playwright/mcp@latest",
+    );
+    expect(state.status).toBe("unknown");
+    expect(state.restartSafe).toBe(false);
   });
 });
