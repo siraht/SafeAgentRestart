@@ -1,8 +1,8 @@
 # SafeAgentRestart
 
-Dry-run-first tooling for safely restarting and resuming tmux-hosted Codex and Claude Code agents.
+Dry-run-first tooling for safely restarting and resuming tmux-hosted Codex, Claude Code, and OpenCode agents.
 
-SafeAgentRestart inventories tmux panes, captures scrollback, extracts visible session IDs, and prints the resume command that should be used after a manual graceful quit. It is built for long-running NTM/tmux workstations where agent panes may be days or weeks old.
+SafeAgentRestart inventories tmux panes, detects agent CLI update commands, captures scrollback, extracts visible session IDs, and prints the resume command that should be used after a manual graceful quit. It is built for long-running NTM/tmux workstations where agent panes may be days or weeks old.
 
 ## Safety Model
 
@@ -12,7 +12,7 @@ This tool does **not**:
 - quit agents
 - kill processes
 - respawn tmux panes
-- run `codex resume` or `claude --resume`
+- run CLI updates, reinstalls, or resume commands
 
 It only reads tmux/process state and writes optional capture files.
 
@@ -31,6 +31,12 @@ bun src/safe-agent-restart.ts --help
 Or install/link it using your preferred Bun workflow.
 
 ## Commands
+
+Detect the installed agent CLI update commands:
+
+```bash
+bun src/safe-agent-restart.ts update-plan --text
+```
 
 Inventory live agent panes:
 
@@ -77,4 +83,27 @@ Claude Code:
 ```bash
 claude --dangerously-skip-permissions --resume <session-id>
 claude --dangerously-skip-permissions --continue
+```
+
+OpenCode:
+
+```bash
+opencode --session <session-id>
+opencode --continue
+```
+
+## Update Syntax
+
+Run updates before quitting live panes. The `update-plan` command detects the install method where possible and prints the matching command. On this machine, that maps to:
+
+```bash
+codex update
+claude update
+opencode upgrade --method bun
+```
+
+Claude Code also exposes a force reinstall path for unhealthy native installs:
+
+```bash
+claude install stable --force
 ```

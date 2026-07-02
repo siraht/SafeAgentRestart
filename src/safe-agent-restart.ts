@@ -27,6 +27,7 @@ interface AgentDetection {
 interface RestartPlan {
   generatedAt: string;
   scrollbackLines: number;
+  updatePlan: UpdatePlan;
   panes: RestartPlanItem[];
 }
 
@@ -39,6 +40,27 @@ interface RestartPlanItem {
   sessionIds: string[];
   recommendedResumeCommand?: string;
   gracefulQuitKeys: string[];
+  notes: string[];
+}
+
+type ManagedTool = "codex" | "claude" | "opencode";
+
+interface UpdatePlan {
+  generatedAt: string;
+  tools: ToolUpdate[];
+  commands: string[];
+  notes: string[];
+}
+
+interface ToolUpdate {
+  tool: ManagedTool;
+  available: boolean;
+  command?: string;
+  path?: string;
+  resolvedPath?: string;
+  version?: string;
+  installMethod?: string;
+  reinstallCommand?: string;
   notes: string[];
 }
 
@@ -218,10 +240,11 @@ USAGE:
   safe-agent-restart <command> [options]
 
 COMMANDS:
+  update-plan            Detect installed agent CLIs and print update/reinstall commands
   inventory              Read-only inventory of tmux panes and live agent processes
   capture                Capture pane scrollback to files without sending keys
   plan                   Build read-only restart/resume plan from pane scrollback
-  sequence               Print the manual restart sequence for Codex and Claude
+  sequence               Print the manual restart sequence for Codex, Claude, and OpenCode
   help                   Show this help
 
 OPTIONS:
@@ -233,8 +256,8 @@ OPTIONS:
   --text                 Emit concise text
 
 SAFETY:
-  This tool does not quit, interrupt, respawn, or restart agents. It only reads tmux state
-  and captures scrollback.`);
+  This tool does not quit, interrupt, respawn, restart agents, or run update commands.
+  It only reads tmux/process state and captures scrollback.`);
 }
 
 function capture(options: CliOptions): { outputDir: string; captures: Array<{ pane: string; path: string }> } {
@@ -259,6 +282,7 @@ function buildPlan(options: CliOptions): RestartPlan {
   return {
     generatedAt: new Date().toISOString(),
     scrollbackLines: options.scrollback,
+    updatePlan: buildUpdatePlan(),
     panes: panes.map((pane) => {
       const scrollback = safeRun("tmux", ["capture-pane", "-p", "-t", pane.paneId, "-S", `-${options.scrollback}`]);
       const sessionIds = extractSessionIds(scrollback);
@@ -297,12 +321,16 @@ export function buildResumeCommand(kind: AgentKind, sessionId: string | undefine
       : "claude --dangerously-skip-permissions --continue";
   }
 
+  if (kind === "opencode") {
+    return sessionId ? `opencode --session ${sessionId}` : "opencode --continue";
+  }
+
   return undefined;
 }
 
 function buildNotes(kind: AgentKind, sessionId: string | undefined): string[] {
   if (kind === "opencode") {
-    return ["OpenCode resume syntax is not managed by this tool yet; capture scrollback before touching the pane."];
+    return ["OpenCode does not expose a yolo/bypass flag in local help; resume command uses its session or continue option."];
   }
   if (!sessionId) {
     return ["No UUID-style session id was visible in captured scrollback; command uses latest-session fallback."];
@@ -310,8 +338,115 @@ function buildNotes(kind: AgentKind, sessionId: string | undefined): string[] {
   return ["Review captured scrollback before quitting if the pane appears mid-task."];
 }
 
+export function detectToolUpdate(tool: ManagedTool): ToolUpdate {
+  const path = which(tool);
+  if (!path) {
+    return {
+      tool,
+      available: false,
+      notes: [`${tool} is not on PATH.`],
+    };
+  }
+
+  const resolvedPath = safeRun("readlink", ["-f", path]).trim() || path;
+  const version = safeRun(tool, ["--version"]).trim().split("\n")[0]?.trim();
+  const detected = detectInstallMethod(tool, path, resolvedPath);
+  return {
+    tool,
+    available: true,
+    path,
+    resolvedPath,
+    ...(version ? { version } : {}),
+    ...(detected.installMethod ? { installMethod: detected.installMethod } : {}),
+    ...(detected.command ? { command: detected.command } : {}),
+    ...(detected.reinstallCommand ? { reinstallCommand: detected.reinstallCommand } : {}),
+    notes: detected.notes,
+  };
+}
+
+function detectInstallMethod(
+  tool: ManagedTool,
+  path: string,
+  resolvedPath: string,
+): Pick<ToolUpdate, "installMethod" | "command" | "reinstallCommand" | "notes"> {
+  if (tool === "codex") {
+    if (resolvedPath.includes("/.codex/packages/standalone/") || path.includes("/.codex/packages/standalone/")) {
+      return {
+        installMethod: "codex standalone",
+        command: "codex update",
+        notes: ["Detected Codex standalone install; use its built-in updater before restarting panes."],
+      };
+    }
+    return {
+      installMethod: "unknown",
+      command: "codex update",
+      notes: ["Codex is available, but the install method is not recognized; built-in update is the safest generic command."],
+    };
+  }
+
+  if (tool === "claude") {
+    if (resolvedPath.includes("/.local/share/claude/versions/")) {
+      return {
+        installMethod: "claude native",
+        command: "claude update",
+        reinstallCommand: "claude install stable --force",
+        notes: ["Detected Claude Code native install; update first, or force reinstall stable if update reports corruption."],
+      };
+    }
+    return {
+      installMethod: "unknown",
+      command: "claude update",
+      reinstallCommand: "claude install stable --force",
+      notes: ["Claude Code is available, but the install method is not recognized; built-in update is the safest generic command."],
+    };
+  }
+
+  if (path.includes("/.bun/bin/") || resolvedPath.includes("/.bun/lib/node_modules/opencode-ai/")) {
+    return {
+      installMethod: "bun global",
+      command: "opencode upgrade --method bun",
+      notes: ["Detected OpenCode Bun global install; pin the upgrade method so it uses the same package manager."],
+    };
+  }
+
+  return {
+    installMethod: "unknown",
+    command: "opencode upgrade",
+    notes: ["OpenCode is available, but the install method is not recognized; review opencode upgrade --help before running."],
+  };
+}
+
+function which(command: string): string | undefined {
+  return safeRun("bash", ["-lc", `command -v ${shellQuote(command)}`]).trim() || undefined;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function buildUpdatePlan(): UpdatePlan {
+  const tools = (["codex", "claude", "opencode"] as const).map(detectToolUpdate);
+  return {
+    generatedAt: new Date().toISOString(),
+    tools,
+    commands: tools.flatMap((tool) => (tool.command ? [tool.command] : [])),
+    notes: [
+      "Run update commands before quitting any live agent pane.",
+      "Review reinstallCommand values only if the normal updater fails or reports an unhealthy install.",
+    ],
+  };
+}
+
 function showSequence(): void {
   console.log(`Safe manual restart sequence
+
+0. Update agent CLIs before touching live panes:
+   safe-agent-restart update-plan --text
+
+   Run the printed update commands. On this machine that normally means:
+   Codex:   codex update
+   Claude:  claude update
+   OpenCode: opencode upgrade --method bun
 
 1. Capture scrollback:
    safe-agent-restart capture --pane '<session:window.pane>'
@@ -326,12 +461,14 @@ function showSequence(): void {
    tmux capture-pane -p -t '<session:window.pane>' -S -5000
 
 5. Resume with the planned command, or replace the session id with the post-quit id:
-   Codex:  codex --dangerously-bypass-approvals-and-sandbox resume <session-id>
-   Claude: claude --dangerously-skip-permissions --resume <session-id>
+   Codex:    codex --dangerously-bypass-approvals-and-sandbox resume <session-id>
+   Claude:   claude --dangerously-skip-permissions --resume <session-id>
+   OpenCode: opencode --session <session-id>
 
 Fallbacks when no session id is visible:
-   Codex:  codex --dangerously-bypass-approvals-and-sandbox resume --last
-   Claude: claude --dangerously-skip-permissions --continue
+   Codex:    codex --dangerously-bypass-approvals-and-sandbox resume --last
+   Claude:   claude --dangerously-skip-permissions --continue
+   OpenCode: opencode --continue
 
 This project intentionally does not automate steps 3-5 yet.`);
 }
@@ -351,9 +488,30 @@ function printResult(value: unknown, json: boolean): void {
   }
 
   if (isRestartPlan(value)) {
+    console.log("preflight updates:");
+    for (const command of value.updatePlan.commands) {
+      console.log(`  ${command}`);
+    }
     for (const pane of value.panes) {
       console.log(`${pane.pane}\t${pane.kind}\t${pane.recommendedResumeCommand ?? "no-resume-command"}\tcwd=${pane.cwd}`);
       for (const note of pane.notes) {
+        console.log(`  note: ${note}`);
+      }
+    }
+    return;
+  }
+
+  if (isUpdatePlan(value)) {
+    for (const tool of value.tools) {
+      if (!tool.available) {
+        console.log(`${tool.tool}\tunavailable`);
+        continue;
+      }
+      console.log(`${tool.tool}\t${tool.installMethod ?? "unknown"}\t${tool.command ?? "no-update-command"}\tversion=${tool.version ?? "unknown"}`);
+      if (tool.reinstallCommand) {
+        console.log(`  reinstall-if-needed: ${tool.reinstallCommand}`);
+      }
+      for (const note of tool.notes) {
         console.log(`  note: ${note}`);
       }
     }
@@ -367,11 +525,17 @@ function isRestartPlan(value: unknown): value is RestartPlan {
   return Boolean(value && typeof value === "object" && "panes" in value);
 }
 
+function isUpdatePlan(value: unknown): value is UpdatePlan {
+  return Boolean(value && typeof value === "object" && "tools" in value && "commands" in value);
+}
+
 function main(): void {
   try {
     const options = parseArgs(process.argv.slice(2));
     if (options.command === "help") {
       showHelp();
+    } else if (options.command === "update-plan") {
+      printResult(buildUpdatePlan(), options.json);
     } else if (options.command === "inventory") {
       printResult(inventory(options), options.json);
     } else if (options.command === "capture") {

@@ -51,4 +51,11 @@ describe("buildResumeCommand", () => {
     );
     expect(buildResumeCommand("claude", undefined)).toBe("claude --dangerously-skip-permissions --continue");
   });
+
+  test("builds OpenCode exact and fallback resume commands", () => {
+    expect(buildResumeCommand("opencode", "019e2816-ca83-78e1-8c1e-222222222222")).toBe(
+      "opencode --session 019e2816-ca83-78e1-8c1e-222222222222",
+    );
+    expect(buildResumeCommand("opencode", undefined)).toBe("opencode --continue");
+  });
 });

@@ -6,24 +6,45 @@ SafeAgentRestart currently recognizes:
 
 - Codex
 - Claude Code
-- OpenCode, inventory only
+- OpenCode
 
-OpenCode resume syntax is intentionally not generated yet.
+OpenCode does not expose a yolo/bypass flag in local help. SafeAgentRestart generates its `--session` and `--continue` resume syntax, but it does not add any permission-bypass option.
 
 ## Conservative Restart Policy
 
 The project separates observation from mutation:
 
-1. `inventory` reads tmux pane metadata and process trees.
-2. `capture` reads scrollback and writes files.
-3. `plan` reads scrollback and prints candidate resume commands.
-4. Human operators perform quit and resume actions manually.
+1. `update-plan` detects installed CLIs and prints update/reinstall commands.
+2. `inventory` reads tmux pane metadata and process trees.
+3. `capture` reads scrollback and writes files.
+4. `plan` reads scrollback and prints candidate resume commands.
+5. Human operators perform updates, quit, and resume actions manually.
 
 This keeps accidental restarts out of scheduled jobs and agent automation.
 
 ## Recommended Full Workflow
 
-For each pane:
+First, update the agent CLIs before touching live panes:
+
+```bash
+bun src/safe-agent-restart.ts update-plan --text
+```
+
+Run the printed update commands. On this machine, the expected commands are:
+
+```bash
+codex update
+claude update
+opencode upgrade --method bun
+```
+
+Claude Code also exposes this force reinstall fallback for unhealthy native installs:
+
+```bash
+claude install stable --force
+```
+
+Then process one pane at a time:
 
 ```bash
 bun src/safe-agent-restart.ts capture --pane '<pane>'
