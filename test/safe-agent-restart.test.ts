@@ -73,6 +73,12 @@ describe("assessTurnState", () => {
     expect(state.restartSafe).toBe(false);
   });
 
+  test("does not treat an empty Codex prompt as a safe idle signal", () => {
+    const state = assessTurnState("codex", "› ", "codex,100 --dangerously-bypass-approvals-and-sandbox");
+    expect(state.status).toBe("unknown");
+    expect(state.restartSafe).toBe(false);
+  });
+
   test("marks prompt draft text as unknown to avoid losing input", () => {
     const state = assessTurnState("codex", "Conversation interrupted\n\n› Implement {feature}", "codex,100 --dangerously-bypass-approvals-and-sandbox");
     expect(state.status).toBe("unknown");

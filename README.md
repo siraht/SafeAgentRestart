@@ -104,6 +104,7 @@ The agent CLIs do not currently expose a reliable cross-tool "between turns" API
 
 - visible idle prompt and no active child process: `restartSafe=true`
 - visible activity marker: `restartSafe=false`
+- Codex `›` prompt by itself: `restartSafe=false`
 - typed prompt draft, persistent child service, or no reliable prompt: `restartSafe=false`
 
 Any future automation should only restart panes where `readiness` or `plan` reports `restartSafe=true`.

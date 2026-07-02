@@ -66,6 +66,8 @@ Codex, Claude Code, and OpenCode do not expose a stable shared API that says "th
 - `busy` with `restartSafe=false`: visible activity marker or active child tool command.
 - `unknown` with `restartSafe=false`: typed prompt draft, persistent child service, missing prompt, or ambiguous screen state.
 
+Codex is stricter than Claude Code here: an empty `›` prompt is not enough to mark Codex idle because that marker can remain visible after submitting a message.
+
 Scheduled automation should skip every pane except `restartSafe=true`. This intentionally favors missing restart opportunities over interrupting a live turn.
 
 ## Why Not `ntm respawn`

@@ -406,6 +406,16 @@ export function assessTurnState(kind: AgentKind, visibleText: string, processTre
   }
 
   const idlePrompt = detectIdlePrompt(kind, recentText);
+  if (kind === "codex" && idlePrompt) {
+    evidence.push(`codex prompt marker: ${idlePrompt}`);
+    return {
+      status: "unknown",
+      restartSafe: false,
+      evidence,
+      notes: ["Codex keeps its prompt marker visible after submitting work, so prompt presence alone is not a safe idle signal."],
+    };
+  }
+
   if (idlePrompt) {
     evidence.push(`idle prompt marker: ${idlePrompt}`);
     return {
