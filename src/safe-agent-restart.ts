@@ -22,7 +22,24 @@ interface AgentDetection {
   rootPid?: number;
   invocation?: string;
   bypassMode: boolean;
-  resumeCommand?: string;
+}
+
+interface RestartPlan {
+  generatedAt: string;
+  scrollbackLines: number;
+  panes: RestartPlanItem[];
+}
+
+interface RestartPlanItem {
+  pane: string;
+  paneId: string;
+  cwd: string;
+  kind: AgentKind;
+  currentBypassMode: boolean;
+  sessionIds: string[];
+  recommendedResumeCommand?: string;
+  gracefulQuitKeys: string[];
+  notes: string[];
 }
 
 interface CliOptions {
@@ -203,6 +220,8 @@ USAGE:
 COMMANDS:
   inventory              Read-only inventory of tmux panes and live agent processes
   capture                Capture pane scrollback to files without sending keys
+  plan                   Build read-only restart/resume plan from pane scrollback
+  sequence               Print the manual restart sequence for Codex and Claude
   help                   Show this help
 
 OPTIONS:
@@ -235,6 +254,88 @@ function capture(options: CliOptions): { outputDir: string; captures: Array<{ pa
   return { outputDir, captures };
 }
 
+function buildPlan(options: CliOptions): RestartPlan {
+  const panes = inventory(options).filter((pane) => pane.agent.kind !== "unknown");
+  return {
+    generatedAt: new Date().toISOString(),
+    scrollbackLines: options.scrollback,
+    panes: panes.map((pane) => {
+      const scrollback = safeRun("tmux", ["capture-pane", "-p", "-t", pane.paneId, "-S", `-${options.scrollback}`]);
+      const sessionIds = extractSessionIds(scrollback);
+      const latestSessionId = sessionIds.at(-1);
+      const recommendedResumeCommand = buildResumeCommand(pane.agent.kind, latestSessionId);
+      return {
+        pane: pane.label,
+        paneId: pane.paneId,
+        cwd: pane.cwd,
+        kind: pane.agent.kind,
+        currentBypassMode: pane.agent.bypassMode,
+        sessionIds,
+        ...(recommendedResumeCommand ? { recommendedResumeCommand } : {}),
+        gracefulQuitKeys: ["C-c"],
+        notes: buildNotes(pane.agent.kind, latestSessionId),
+      };
+    }),
+  };
+}
+
+export function extractSessionIds(text: string): string[] {
+  const matches = text.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) ?? [];
+  return [...new Set(matches.map((match) => match.toLowerCase()))];
+}
+
+export function buildResumeCommand(kind: AgentKind, sessionId: string | undefined): string | undefined {
+  if (kind === "codex") {
+    return sessionId
+      ? `codex --dangerously-bypass-approvals-and-sandbox resume ${sessionId}`
+      : "codex --dangerously-bypass-approvals-and-sandbox resume --last";
+  }
+
+  if (kind === "claude") {
+    return sessionId
+      ? `claude --dangerously-skip-permissions --resume ${sessionId}`
+      : "claude --dangerously-skip-permissions --continue";
+  }
+
+  return undefined;
+}
+
+function buildNotes(kind: AgentKind, sessionId: string | undefined): string[] {
+  if (kind === "opencode") {
+    return ["OpenCode resume syntax is not managed by this tool yet; capture scrollback before touching the pane."];
+  }
+  if (!sessionId) {
+    return ["No UUID-style session id was visible in captured scrollback; command uses latest-session fallback."];
+  }
+  return ["Review captured scrollback before quitting if the pane appears mid-task."];
+}
+
+function showSequence(): void {
+  console.log(`Safe manual restart sequence
+
+1. Capture scrollback:
+   safe-agent-restart capture --pane '<session:window.pane>'
+
+2. Build the read-only plan:
+   safe-agent-restart plan --pane '<session:window.pane>' --text
+
+3. Gracefully quit only that pane's agent:
+   tmux send-keys -t '<session:window.pane>' C-c
+
+4. Capture the post-quit output:
+   tmux capture-pane -p -t '<session:window.pane>' -S -5000
+
+5. Resume with the planned command, or replace the session id with the post-quit id:
+   Codex:  codex --dangerously-bypass-approvals-and-sandbox resume <session-id>
+   Claude: claude --dangerously-skip-permissions --resume <session-id>
+
+Fallbacks when no session id is visible:
+   Codex:  codex --dangerously-bypass-approvals-and-sandbox resume --last
+   Claude: claude --dangerously-skip-permissions --continue
+
+This project intentionally does not automate steps 3-5 yet.`);
+}
+
 function printResult(value: unknown, json: boolean): void {
   if (json) {
     console.log(JSON.stringify(value, null, 2));
@@ -249,7 +350,21 @@ function printResult(value: unknown, json: boolean): void {
     return;
   }
 
+  if (isRestartPlan(value)) {
+    for (const pane of value.panes) {
+      console.log(`${pane.pane}\t${pane.kind}\t${pane.recommendedResumeCommand ?? "no-resume-command"}\tcwd=${pane.cwd}`);
+      for (const note of pane.notes) {
+        console.log(`  note: ${note}`);
+      }
+    }
+    return;
+  }
+
   console.log(String(value));
+}
+
+function isRestartPlan(value: unknown): value is RestartPlan {
+  return Boolean(value && typeof value === "object" && "panes" in value);
 }
 
 function main(): void {
@@ -261,6 +376,10 @@ function main(): void {
       printResult(inventory(options), options.json);
     } else if (options.command === "capture") {
       printResult(capture(options), options.json);
+    } else if (options.command === "plan") {
+      printResult(buildPlan(options), options.json);
+    } else if (options.command === "sequence") {
+      showSequence();
     } else {
       throw new Error(`Unknown command: ${options.command}`);
     }
